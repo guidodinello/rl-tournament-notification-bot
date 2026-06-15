@@ -1,13 +1,17 @@
 import asyncio
 import json
 import re
-from datetime import date, datetime, timezone
+from datetime import date
 from functools import wraps
 from pathlib import Path
 from typing import Any, TypedDict
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackContext, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackContext,
+    CommandHandler,
+)
 from telegram.helpers import escape_markdown
 
 from .config import Config
@@ -26,10 +30,10 @@ class BotData(TypedDict):
 CustomContext = CallbackContext[Any, dict, dict, BotData]
 
 _TYPE_ICONS = {
-    "World Championship": "\U0001F3C6",
-    "Major": "\U0001F30D",
-    "Open": "\U0001F3B2",
-    "Last Chance Qualifier": "\U0001F3AA",
+    "World Championship": "\U0001f3c6",
+    "Major": "\U0001f30d",
+    "Open": "\U0001f3b2",
+    "Last Chance Qualifier": "\U0001f3aa",
 }
 
 _TYPE_LABELS = {
@@ -40,8 +44,18 @@ _TYPE_LABELS = {
 }
 
 MONTHS_ES = [
-    "enero", "febrero", "marzo", "abril", "mayo", "junio",
-    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+    "enero",
+    "febrero",
+    "marzo",
+    "abril",
+    "mayo",
+    "junio",
+    "julio",
+    "agosto",
+    "septiembre",
+    "octubre",
+    "noviembre",
+    "diciembre",
 ]
 
 
@@ -56,23 +70,25 @@ def _tournament_id(t: Tournament) -> str:
 
 def _build_tournament_keyboard(t: Tournament) -> InlineKeyboardMarkup:
     full_url = f"https://liquipedia.net{t.liquipedia_url}"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Ver en Liquipedia", url=full_url)],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Ver en Liquipedia", url=full_url)],
+        ]
+    )
 
 
 def _format_tournament_message(t: Tournament, days_left: int) -> str:
-    icon = _TYPE_ICONS.get(t.event_type, "\U0001F3C6")
+    icon = _TYPE_ICONS.get(t.event_type, "\U0001f3c6")
     mode_tag = f" [{t.mode}]" if t.mode else ""
     name = f"{icon} *{escape_markdown(t.name, version=1)}*{mode_tag}"
     date_str = _format_date(t.start_date)
-    day_str = f"\U0001F4C5 *{days_left} d\u00edas*" if days_left > 0 else "\U0001F4C5 \u00a1Hoy!"
+    day_str = f"\U0001f4c5 *{days_left} d\u00edas*" if days_left > 0 else "\U0001f4c5 \u00a1Hoy!"
 
     lines = [
         name,
         "",
-        f"\U0001F4C5 Comienza: {date_str} {day_str}",
-        f"\U0001F30D Regi\u00f3n: {t.region}",
+        f"\U0001f4c5 Comienza: {date_str} {day_str}",
+        f"\U0001f30d Regi\u00f3n: {t.region}",
     ]
 
     return "\n".join(lines)
@@ -161,7 +177,7 @@ async def cmd_start(update: Update, context: CustomContext) -> None:
     if chat_id:
         context.bot_data["chat_store"].set_chat(update.effective_user.id, chat_id)
     await update.message.reply_text(
-        "\U0001F916 \u00a1Hola! Soy el bot de notificaciones de torneos RLCS.\n\n"
+        "\U0001f916 \u00a1Hola! Soy el bot de notificaciones de torneos RLCS.\n\n"
         "Te avisar\u00e9 cuando se acerque un torneo.\n\n"
         "Comandos:\n"
         "/next \u2014 Pr\u00f3ximo torneo RLCS\n"
@@ -209,7 +225,7 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
     for t in tournaments:
         groups.setdefault(t.event_type, []).append(t)
 
-    lines: list[str] = ["\U0001F4CB *Pr\u00f3ximos torneos RLCS:*\n"]
+    lines: list[str] = ["\U0001f4cb *Pr\u00f3ximos torneos RLCS:*\n"]
 
     type_order = ["World Championship", "Major", "Open", "Last Chance Qualifier"]
 
@@ -218,21 +234,22 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
         if not group:
             continue
 
-        icon = _TYPE_ICONS.get(event_type, "\U0001F3C6")
+        icon = _TYPE_ICONS.get(event_type, "\U0001f3c6")
         label = _TYPE_LABELS.get(event_type, event_type)
         lines.append(f"{icon} *{label}*")
 
         for t in group:
             days = (t.start_date - date.today()).days
             date_str = _format_date(t.start_date)
-            mode_tag = f" ({t.mode})" if t.mode and event_type != "Open" else ""
             region_safe = escape_markdown(t.region, version=1)
             day_str = f"{days} d\u00edas" if days > 0 else "\u00a1Hoy!"
 
             if event_type in ("World Championship", "Major"):
                 lines.append(f"  \u2022 {region_safe} \u2014 {day_str} ({date_str})")
             elif event_type == "Open":
-                lines.append(f"  \u2022 {t.mode} \u2014 {region_safe} \u2014 {day_str} ({date_str})")
+                lines.append(
+                    f"  \u2022 {t.mode} \u2014 {region_safe} \u2014 {day_str} ({date_str})"
+                )
             else:
                 lines.append(f"  \u2022 {region_safe} \u2014 {day_str} ({date_str})")
 
@@ -249,9 +266,7 @@ async def cmd_refresh(update: Update, context: CustomContext) -> None:
     await update.message.reply_text("Recargando datos desde Liquipedia...")
     tournaments = await fetch_upcoming_tournaments()
     if tournaments:
-        await update.message.reply_text(
-            f"Listo. {len(tournaments)} torneo(s) encontrado(s)."
-        )
+        await update.message.reply_text(f"Listo. {len(tournaments)} torneo(s) encontrado(s).")
         await _check_and_notify(context.bot_data, tournaments, force_notify=False)
     else:
         await update.message.reply_text("No se encontraron torneos o hubo un error.")
@@ -289,6 +304,7 @@ async def _check_and_notify(
             keyboard = _build_tournament_keyboard(t)
             try:
                 from telegram.ext import Application as App
+
                 app: App = bot_data.get("_application")  # type: ignore
                 if app:
                     await app.bot.send_message(

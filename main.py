@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import signal
 
 from telegram.ext import ApplicationBuilder, ContextTypes
@@ -32,10 +33,8 @@ async def main_async(config: Config) -> None:
             t.cancel()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
+        with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _shutdown)
-        except NotImplementedError:
-            pass
 
     await asyncio.gather(*tasks, return_exceptions=True)
 

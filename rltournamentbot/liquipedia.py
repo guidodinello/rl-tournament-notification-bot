@@ -92,9 +92,7 @@ def _is_rlcs_event(heading_text: str) -> bool:
     text = heading_text.lower()
     if "rlcs" in text:
         return True
-    if "last chance qualifier" in text:
-        return True
-    return False
+    return "last chance qualifier" in text
 
 
 def _is_skip_panel(heading_text: str) -> bool:
@@ -124,15 +122,17 @@ def _parse_worlds_or_major(heading: Tag, body: Tag | None, heading_text: str) ->
 
     event_type = "World Championship" if "World Championship" in name else "Major"
 
-    return [Tournament(
-        name=name,
-        start_date=start_date,
-        end_date=None,
-        region=region,
-        liquipedia_url=url,
-        event_type=event_type,
-        mode="3v3",
-    )]
+    return [
+        Tournament(
+            name=name,
+            start_date=start_date,
+            end_date=None,
+            region=region,
+            liquipedia_url=url,
+            event_type=event_type,
+            mode="3v3",
+        )
+    ]
 
 
 def _parse_lcq(heading: Tag, body: Tag | None, heading_text: str) -> list[Tournament]:
@@ -151,15 +151,17 @@ def _parse_lcq(heading: Tag, body: Tag | None, heading_text: str) -> list[Tourna
         if not start_date:
             start_date = date.today() + timedelta(days=1)
 
-        tournaments.append(Tournament(
-            name=f"RLCS 2026 Last Chance Qualifier \u2014 {region_name}",
-            start_date=start_date,
-            end_date=None,
-            region=region_name,
-            liquipedia_url=region_url,
-            event_type="Last Chance Qualifier",
-            mode="3v3",
-        ))
+        tournaments.append(
+            Tournament(
+                name=f"RLCS 2026 Last Chance Qualifier \u2014 {region_name}",
+                start_date=start_date,
+                end_date=None,
+                region=region_name,
+                liquipedia_url=region_url,
+                event_type="Last Chance Qualifier",
+                mode="3v3",
+            )
+        )
 
     return tournaments
 
@@ -189,15 +191,17 @@ def _parse_opens(body: Tag | None, heading_text: str) -> list[Tournament]:
                 start_date = _parse_timestamp(timer["data-timestamp"])
 
             if start_date and start_date >= date.today():
-                tournaments.append(Tournament(
-                    name=f"RLCS 2026 {mode} Open \u2014 {region_name}",
-                    start_date=start_date,
-                    end_date=None,
-                    region=region_name,
-                    liquipedia_url=region_url,
-                    event_type="Open",
-                    mode=mode,
-                ))
+                tournaments.append(
+                    Tournament(
+                        name=f"RLCS 2026 {mode} Open \u2014 {region_name}",
+                        start_date=start_date,
+                        end_date=None,
+                        region=region_name,
+                        liquipedia_url=region_url,
+                        event_type="Open",
+                        mode=mode,
+                    )
+                )
 
     return tournaments
 
