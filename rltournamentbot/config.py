@@ -36,6 +36,8 @@ def load_config() -> Config:
     if not raw_ids:
         raise ValueError("ALLOWED_USER_IDS is required")
 
+    raw_ids = raw_ids.strip("\"'").replace('"', "").replace("'", "")
+
     try:
         allowed = frozenset(int(uid.strip()) for uid in raw_ids.split(",") if uid.strip())
     except ValueError as e:
