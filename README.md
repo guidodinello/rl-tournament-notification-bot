@@ -21,6 +21,19 @@ uv sync
 uv run python main.py
 ```
 
+## Development
+
+```bash
+uv sync --dev
+uv run pre-commit install
+```
+
+Pre-commit runs Ruff linter and formatter on every commit. To run on all files:
+
+```bash
+uv run pre-commit run --all-files
+```
+
 ## Commands
 
 | Command | Description |
