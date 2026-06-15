@@ -22,7 +22,7 @@ sync_env() {
 }
 
 recreate() {
-    $SSH "cd $REMOTE_DIR && docker rm -f rlbot; docker run -d --name rlbot --restart unless-stopped --network=host --env-file .env --log-opt max-size=10m --log-opt max-file=3 rlbot"
+    $SSH "cd $REMOTE_DIR && docker rm -f rlbot; docker run -d --name rlbot --restart unless-stopped --env-file .env rlbot"
     echo "Waiting for bot to start..."
     $SSH "docker logs -f rlbot 2>&1 | grep -m1 'Application started'"
     echo "Bot is up."
