@@ -45,7 +45,9 @@ uv run pre-commit run --all-files
 
 ## Notifications
 
-The bot polls Liquipedia every `POLL_INTERVAL_MINUTES` (default 60). When a tournament is starting within `NOTIFY_DAYS_AHEAD` days, it sends a notification with event details and a "Ver en Liquipedia" link. Already-announced events are tracked in `announced.json` to avoid duplicates.
+The bot polls Liquipedia every `POLL_INTERVAL_MINUTES` (default 60). When a tournament is starting within `NOTIFY_DAYS_AHEAD` days, it sends a notification with event details and a "Ver en Liquipedia" link. A tournament is recorded as announced (in `<STATE_DIR>/announced.json`) only after the message is successfully delivered, so a missing chat or a transient failure does not permanently suppress it.
+
+The bot can only push to chats it knows about. Any authorized interaction (e.g. `/next`, `/start`) registers your chat in `<STATE_DIR>/user_chats.json`. Keep `STATE_DIR` on a persistent volume so this survives restarts — the included `deploy.sh` mounts the `rlbot-data` Docker volume at `/app/state` for this.
 
 ## Configuration
 
@@ -55,6 +57,7 @@ The bot polls Liquipedia every `POLL_INTERVAL_MINUTES` (default 60). When a tour
 | `ALLOWED_USER_IDS` | Yes | — | Comma-separated Telegram user IDs |
 | `NOTIFY_DAYS_AHEAD` | Yes | — | Days before an event to send notification |
 | `POLL_INTERVAL_MINUTES` | No | 60 | How often to check Liquipedia |
+| `STATE_DIR` | No | `state` | Directory for persisted state (`announced.json`, `user_chats.json`) |
 | `LOG_LEVEL` | No | INFO | Logging level |
 | `LOG_FILE` | No | `logs/rlbot_<date>.log` | Log file path |
 

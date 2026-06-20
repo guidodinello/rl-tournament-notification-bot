@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import re
@@ -24,7 +26,8 @@ logger = get_logger(__name__)
 
 class BotData(TypedDict):
     config: Config
-    chat_store: "ChatStore"
+    chat_store: ChatStore
+    _application: Application
 
 
 CustomContext = CallbackContext[Any, dict, dict, BotData]
@@ -64,7 +67,10 @@ def _format_date(d: date) -> str:
 
 
 def _tournament_id(t: Tournament) -> str:
-    raw = f"{t.name}-{t.start_date.isoformat()}-{t.region}".lower()
+    # Deliberately excludes start_date: Liquipedia frequently nudges dates as an
+    # event firms up, and keying on the date would make a reschedule look like a
+    # brand-new tournament and re-fire (or, mid-window, drop) the notification.
+    raw = f"{t.name}-{t.region}".lower()
     return re.sub(r"[^a-z0-9-]+", "-", raw).strip("-")
 
 
@@ -109,9 +115,12 @@ class ChatStore:
                 self._chats = {}
 
     def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps({"chats": self._chats}, indent=2))
 
     def set_chat(self, user_id: int, chat_id: int) -> None:
+        if self._chats.get(str(user_id)) == chat_id:
+            return
         self._chats[str(user_id)] = chat_id
         self._save()
 
@@ -134,6 +143,7 @@ class AnnouncedTracker:
                 self._announced = set()
 
     def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps({"announced": list(self._announced)}, indent=2))
 
     def is_announced(self, tid: str) -> bool:
@@ -164,6 +174,11 @@ def _require_auth(handler):
             elif update.message:
                 await update.message.reply_text("Access denied.")
             return
+        # Remember the chat for every authorized interaction (not just /start),
+        # so a user who only ever runs /next is still reachable for push alerts.
+        chat = update.effective_chat
+        if chat is not None:
+            context.bot_data["chat_store"].set_chat(user.id, chat.id)
         return await handler(update, context)
 
     return wrapper
@@ -171,11 +186,9 @@ def _require_auth(handler):
 
 @_require_auth
 async def cmd_start(update: Update, context: CustomContext) -> None:
-    if update.message is None or update.effective_user is None:
+    if update.message is None:
         return
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id:
-        context.bot_data["chat_store"].set_chat(update.effective_user.id, chat_id)
+    # The chat is registered by @_require_auth, so no need to do it here.
     await update.message.reply_text(
         "\U0001f916 \u00a1Hola! Soy el bot de notificaciones de torneos RLCS.\n\n"
         "Te avisar\u00e9 cuando se acerque un torneo.\n\n"
@@ -279,9 +292,14 @@ async def _check_and_notify(
     force_notify: bool = False,
 ) -> None:
     config = bot_data["config"]
-    announced = AnnouncedTracker()
+    announced = AnnouncedTracker(config.state_dir / "announced.json")
     chat_store = bot_data["chat_store"]
+    app = bot_data.get("_application")
     today = date.today()
+
+    if app is None:
+        logger.warning("Application not ready yet; skipping notification check")
+        return
 
     for t in tournaments:
         days = (t.start_date - today).days
@@ -292,30 +310,32 @@ async def _check_and_notify(
         if announced.is_announced(tid) and not force_notify:
             continue
 
-        announced.mark_announced(tid)
+        text = _format_tournament_message(t, days)
+        keyboard = _build_tournament_keyboard(t)
 
+        sent = False
         for uid in config.allowed_user_ids:
             chat_id = chat_store.get_chat(uid)
             if chat_id is None:
                 logger.warning("No chat_id stored for user %s, skipping notification", uid)
                 continue
-
-            text = _format_tournament_message(t, days)
-            keyboard = _build_tournament_keyboard(t)
             try:
-                from telegram.ext import Application as App
-
-                app: App = bot_data.get("_application")  # type: ignore
-                if app:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        parse_mode="Markdown",
-                        reply_markup=keyboard,
-                    )
-                    logger.info("Notified about %s (starts in %d days)", t.name, days)
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+                sent = True
+                logger.info("Notified about %s (starts in %d days)", t.name, days)
             except Exception:
                 logger.exception("Failed to send notification for %s", t.name)
+
+        # Only record the announcement once it has actually reached someone.
+        # Marking it before/regardless of delivery (the previous behavior) meant a
+        # missing chat or a transient send failure permanently suppressed the alert.
+        if sent:
+            announced.mark_announced(tid)
 
 
 async def _poll_task(app: Application, config: Config) -> None:
@@ -331,17 +351,24 @@ async def _poll_task(app: Application, config: Config) -> None:
             tournaments = await fetch_upcoming_tournaments()
             if tournaments:
                 await _check_and_notify(app.bot_data, tournaments)
-            await asyncio.sleep(config.poll_interval_minutes * 60)
         except asyncio.CancelledError:
             logger.info("Poll task cancelled")
             break
         except Exception:
             logger.exception("Error in poll task")
 
+        # Sleep outside the work try/except so an error never skips the wait
+        # and busy-loops on Liquipedia.
+        try:
+            await asyncio.sleep(config.poll_interval_minutes * 60)
+        except asyncio.CancelledError:
+            logger.info("Poll task cancelled")
+            break
+
 
 def build_application(config: Config, app: Application) -> Application:
     app.bot_data["config"] = config
-    app.bot_data["chat_store"] = ChatStore()
+    app.bot_data["chat_store"] = ChatStore(config.state_dir / "user_chats.json")
     app.bot_data["_application"] = app
 
     app.add_handler(CommandHandler("start", cmd_start))
