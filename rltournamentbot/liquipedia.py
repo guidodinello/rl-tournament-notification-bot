@@ -37,11 +37,10 @@ def _parse_days_away(text: str) -> date | None:
     return None
 
 
-def _parse_timestamp(ts: str) -> date | None:
+def _parse_datetime(ts: str) -> datetime | None:
     try:
-        dt = datetime.fromtimestamp(int(ts), tz=UTC)
-        return dt.date()
-    except (ValueError, OSError):
+        return datetime.fromtimestamp(int(ts), tz=UTC)
+    except ValueError, OSError:
         return None
 
 
@@ -145,11 +144,10 @@ def _parse_lcq(heading: Tag, body: Tag | None, heading_text: str) -> list[Tourna
     for col in cols:
         region_url, region_name = _extract_region_url(col)
         timer = col.select_one(".timer-object")
-        start_date: date | None = None
+        start_dt: datetime | None = None
         if timer and timer.get("data-timestamp"):
-            start_date = _parse_timestamp(timer["data-timestamp"])
-        if not start_date:
-            start_date = date.today() + timedelta(days=1)
+            start_dt = _parse_datetime(timer["data-timestamp"])
+        start_date = start_dt.date() if start_dt else date.today() + timedelta(days=1)
 
         tournaments.append(
             Tournament(
@@ -160,6 +158,7 @@ def _parse_lcq(heading: Tag, body: Tag | None, heading_text: str) -> list[Tourna
                 liquipedia_url=region_url,
                 event_type="Last Chance Qualifier",
                 mode="3v3",
+                start_time=start_dt,
             )
         )
 
@@ -186,9 +185,10 @@ def _parse_opens(body: Tag | None, heading_text: str) -> list[Tournament]:
         for col in cols:
             region_url, region_name = _extract_region_url(col)
             timer = col.select_one(".timer-object")
-            start_date: date | None = None
+            start_dt: datetime | None = None
             if timer and timer.get("data-timestamp"):
-                start_date = _parse_timestamp(timer["data-timestamp"])
+                start_dt = _parse_datetime(timer["data-timestamp"])
+            start_date = start_dt.date() if start_dt else None
 
             if start_date and start_date >= date.today():
                 tournaments.append(
@@ -200,6 +200,7 @@ def _parse_opens(body: Tag | None, heading_text: str) -> list[Tournament]:
                         liquipedia_url=region_url,
                         event_type="Open",
                         mode=mode,
+                        start_time=start_dt,
                     )
                 )
 
