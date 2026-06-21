@@ -27,6 +27,8 @@ logger = get_logger(__name__)
 class BotData(TypedDict):
     config: Config
     chat_store: ChatStore
+    announced: AnnouncedTracker
+    notify_lock: asyncio.Lock
     _application: Application
 
 
@@ -67,10 +69,12 @@ def _format_date(d: date) -> str:
 
 
 def _tournament_id(t: Tournament) -> str:
-    # Deliberately excludes start_date: Liquipedia frequently nudges dates as an
-    # event firms up, and keying on the date would make a reschedule look like a
-    # brand-new tournament and re-fire (or, mid-window, drop) the notification.
-    raw = f"{t.name}-{t.region}".lower()
+    # Excludes start_date so a Liquipedia date nudge isn't seen as a new event
+    # (which would re-fire or, mid-window, drop the alert). Includes the
+    # Liquipedia URL -- stable per event page -- so distinct same-name/region
+    # occurrences (e.g. two Opens in a season) stay distinct; the name already
+    # carries the year and mode. Falls back to name+region when no URL is set.
+    raw = f"{t.name}-{t.region}-{t.liquipedia_url}".lower()
     return re.sub(r"[^a-z0-9-]+", "-", raw).strip("-")
 
 
@@ -241,6 +245,7 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
     lines: list[str] = ["\U0001f4cb *Pr\u00f3ximos torneos RLCS:*\n"]
 
     type_order = ["World Championship", "Major", "Open", "Last Chance Qualifier"]
+    today = date.today()
 
     for event_type in type_order:
         group = groups.get(event_type)
@@ -252,7 +257,7 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
         lines.append(f"{icon} *{label}*")
 
         for t in group:
-            days = (t.start_date - date.today()).days
+            days = (t.start_date - today).days
             date_str = _format_date(t.start_date)
             region_safe = escape_markdown(t.region, version=1)
             day_str = f"{days} d\u00edas" if days > 0 else "\u00a1Hoy!"
@@ -292,8 +297,9 @@ async def _check_and_notify(
     force_notify: bool = False,
 ) -> None:
     config = bot_data["config"]
-    announced = AnnouncedTracker(config.state_dir / "announced.json")
+    announced = bot_data["announced"]
     chat_store = bot_data["chat_store"]
+    lock = bot_data["notify_lock"]
     app = bot_data.get("_application")
     today = date.today()
 
@@ -301,41 +307,44 @@ async def _check_and_notify(
         logger.warning("Application not ready yet; skipping notification check")
         return
 
-    for t in tournaments:
-        days = (t.start_date - today).days
-        if days > config.notify_days_ahead and not force_notify:
-            continue
-
-        tid = _tournament_id(t)
-        if announced.is_announced(tid) and not force_notify:
-            continue
-
-        text = _format_tournament_message(t, days)
-        keyboard = _build_tournament_keyboard(t)
-
-        sent = False
-        for uid in config.allowed_user_ids:
-            chat_id = chat_store.get_chat(uid)
-            if chat_id is None:
-                logger.warning("No chat_id stored for user %s, skipping notification", uid)
+    # Serialize against a concurrent caller (background poll vs. /refresh): both
+    # share one tracker, so without this the check-then-send-then-mark window
+    # (which spans an await) could let both send the same notification.
+    async with lock:
+        for t in tournaments:
+            days = (t.start_date - today).days
+            if days > config.notify_days_ahead and not force_notify:
                 continue
-            try:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="Markdown",
-                    reply_markup=keyboard,
-                )
-                sent = True
-                logger.info("Notified about %s (starts in %d days)", t.name, days)
-            except Exception:
-                logger.exception("Failed to send notification for %s", t.name)
 
-        # Only record the announcement once it has actually reached someone.
-        # Marking it before/regardless of delivery (the previous behavior) meant a
-        # missing chat or a transient send failure permanently suppressed the alert.
-        if sent:
-            announced.mark_announced(tid)
+            tid = _tournament_id(t)
+            text = _format_tournament_message(t, days)
+            keyboard = _build_tournament_keyboard(t)
+
+            for uid in config.allowed_user_ids:
+                # Dedup per user: a missing chat or a failed send for one user
+                # must not suppress the alert for the others.
+                key = f"{tid}:{uid}"
+                if announced.is_announced(key) and not force_notify:
+                    continue
+
+                chat_id = chat_store.get_chat(uid)
+                if chat_id is None:
+                    logger.warning("No chat_id stored for user %s, skipping notification", uid)
+                    continue
+
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode="Markdown",
+                        reply_markup=keyboard,
+                    )
+                    # Mark only after this user's delivery succeeds, so a missing
+                    # chat or a transient failure stays retryable on the next poll.
+                    announced.mark_announced(key)
+                    logger.info("Notified user %s about %s (starts in %d days)", uid, t.name, days)
+                except Exception:
+                    logger.exception("Failed to send notification for %s to user %s", t.name, uid)
 
 
 async def _poll_task(app: Application, config: Config) -> None:
@@ -369,6 +378,8 @@ async def _poll_task(app: Application, config: Config) -> None:
 def build_application(config: Config, app: Application) -> Application:
     app.bot_data["config"] = config
     app.bot_data["chat_store"] = ChatStore(config.state_dir / "user_chats.json")
+    app.bot_data["announced"] = AnnouncedTracker(config.state_dir / "announced.json")
+    app.bot_data["notify_lock"] = asyncio.Lock()
     app.bot_data["_application"] = app
 
     app.add_handler(CommandHandler("start", cmd_start))
