@@ -23,6 +23,7 @@ class Config:
     allowed_user_ids: frozenset[int]
     notify_days_ahead: int
     poll_interval_minutes: int = 60
+    state_dir: Path = field(default_factory=lambda: Path("state"))
 
 
 def load_config() -> Config:
@@ -67,6 +68,8 @@ def load_config() -> Config:
     if poll_interval_minutes < 1:
         raise ValueError("POLL_INTERVAL_MINUTES must be at least 1")
 
+    state_dir = Path(os.getenv("STATE_DIR", "state"))
+
     raw_log_level = os.getenv("LOG_LEVEL")
     raw_log_file = os.getenv("LOG_FILE")
     logger_config = LoggerConfig(
@@ -79,5 +82,6 @@ def load_config() -> Config:
         allowed_user_ids=allowed,
         notify_days_ahead=notify_days_ahead,
         poll_interval_minutes=poll_interval_minutes,
+        state_dir=state_dir,
         logger=logger_config,
     )

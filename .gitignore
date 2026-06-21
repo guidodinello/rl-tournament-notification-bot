@@ -10,3 +10,5 @@ logs/
 .env.production
 deploy.env
 announced.json
+user_chats.json
+state/
