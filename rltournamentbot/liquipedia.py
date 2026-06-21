@@ -301,7 +301,14 @@ async def fetch_upcoming_tournaments() -> list[Tournament]:
 
         today = date.today()
         upcoming = [t for t in all_tournaments if t.start_date >= today]
-        upcoming.sort(key=lambda t: t.start_date)
+        upcoming.sort(
+            key=lambda t: (
+                t.start_time
+                or datetime(
+                    t.start_date.year, t.start_date.month, t.start_date.day, 23, 59, 59, tzinfo=UTC
+                )
+            )
+        )
 
         logger.info("Found %d upcoming RLCS tournaments", len(upcoming))
         return upcoming
