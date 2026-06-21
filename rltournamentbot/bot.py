@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, TypedDict
@@ -64,8 +64,31 @@ MONTHS_ES = [
 ]
 
 
+# Uruguay is permanently UTC-3 (no DST since 2015), so a fixed offset is exact.
+UY_TZ = timezone(timedelta(hours=-3))
+
+
 def _format_date(d: date) -> str:
     return f"{d.day} de {MONTHS_ES[d.month - 1]}"
+
+
+def _local_date_and_time(t: Tournament) -> tuple[date, str | None]:
+    # When we have a precise timestamp, derive BOTH the displayed date and time
+    # from the same Uruguay-local instant, so a late-UTC event (e.g. 01:00 UTC)
+    # doesn't show its UTC calendar date next to a previous-day local time.
+    # Worlds/Majors are date-only (parsed from "N Days Away"), so no time.
+    if t.start_time is None:
+        return t.start_date, None
+    local = t.start_time.astimezone(UY_TZ)
+    return local.date(), local.strftime("%H:%M")
+
+
+def _days_until(t: Tournament) -> int:
+    # Count days against the same Uruguay-local reference used for display, so
+    # "¡Hoy!"/"X días" never contradicts the printed date.
+    start, _ = _local_date_and_time(t)
+    today = datetime.now(UY_TZ).date()
+    return (start - today).days
 
 
 def _tournament_id(t: Tournament) -> str:
@@ -87,11 +110,13 @@ def _build_tournament_keyboard(t: Tournament) -> InlineKeyboardMarkup:
     )
 
 
-def _format_tournament_message(t: Tournament, days_left: int) -> str:
+def _format_tournament_message(t: Tournament) -> str:
     icon = _TYPE_ICONS.get(t.event_type, "\U0001f3c6")
     mode_tag = f" [{t.mode}]" if t.mode else ""
     name = f"{icon} *{escape_markdown(t.name, version=1)}*{mode_tag}"
-    date_str = _format_date(t.start_date)
+    local_date, time_str = _local_date_and_time(t)
+    days_left = _days_until(t)
+    date_str = _format_date(local_date)
     day_str = f"\U0001f4c5 *{days_left} d\u00edas*" if days_left > 0 else "\U0001f4c5 \u00a1Hoy!"
 
     lines = [
@@ -100,6 +125,9 @@ def _format_tournament_message(t: Tournament, days_left: int) -> str:
         f"\U0001f4c5 Comienza: {date_str} {day_str}",
         f"\U0001f30d Regi\u00f3n: {t.region}",
     ]
+
+    if time_str:
+        lines.append(f"\U0001f552 Hora: {time_str} (GMT\u22123)")
 
     return "\n".join(lines)
 
@@ -115,7 +143,7 @@ class ChatStore:
             try:
                 data = json.loads(self.path.read_text())
                 self._chats = {str(k): v for k, v in data.get("chats", {}).items()}
-            except (json.JSONDecodeError, OSError):
+            except json.JSONDecodeError, OSError:
                 self._chats = {}
 
     def _save(self) -> None:
@@ -143,7 +171,7 @@ class AnnouncedTracker:
             try:
                 data = json.loads(self.path.read_text())
                 self._announced = set(data.get("announced", []))
-            except (json.JSONDecodeError, OSError):
+            except json.JSONDecodeError, OSError:
                 self._announced = set()
 
     def _save(self) -> None:
@@ -221,8 +249,7 @@ async def cmd_next(update: Update, context: CustomContext) -> None:
         return
 
     next_t = tournaments[0]
-    days = (next_t.start_date - date.today()).days
-    text = _format_tournament_message(next_t, days)
+    text = _format_tournament_message(next_t)
     keyboard = _build_tournament_keyboard(next_t)
     await msg.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
@@ -245,7 +272,6 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
     lines: list[str] = ["\U0001f4cb *Pr\u00f3ximos torneos RLCS:*\n"]
 
     type_order = ["World Championship", "Major", "Open", "Last Chance Qualifier"]
-    today = date.today()
 
     for event_type in type_order:
         group = groups.get(event_type)
@@ -257,19 +283,20 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
         lines.append(f"{icon} *{label}*")
 
         for t in group:
-            days = (t.start_date - today).days
-            date_str = _format_date(t.start_date)
+            days = _days_until(t)
+            local_date, time_str = _local_date_and_time(t)
+            date_str = _format_date(local_date)
             region_safe = escape_markdown(t.region, version=1)
             day_str = f"{days} d\u00edas" if days > 0 else "\u00a1Hoy!"
 
+            when = f"{date_str} {time_str}h" if time_str else date_str
+
             if event_type in ("World Championship", "Major"):
-                lines.append(f"  \u2022 {region_safe} \u2014 {day_str} ({date_str})")
+                lines.append(f"  \u2022 {region_safe} \u2014 {day_str} ({when})")
             elif event_type == "Open":
-                lines.append(
-                    f"  \u2022 {t.mode} \u2014 {region_safe} \u2014 {day_str} ({date_str})"
-                )
+                lines.append(f"  \u2022 {t.mode} \u2014 {region_safe} \u2014 {day_str} ({when})")
             else:
-                lines.append(f"  \u2022 {region_safe} \u2014 {day_str} ({date_str})")
+                lines.append(f"  \u2022 {region_safe} \u2014 {day_str} ({when})")
 
         lines.append("")
 
@@ -301,7 +328,6 @@ async def _check_and_notify(
     chat_store = bot_data["chat_store"]
     lock = bot_data["notify_lock"]
     app = bot_data.get("_application")
-    today = date.today()
 
     if app is None:
         logger.warning("Application not ready yet; skipping notification check")
@@ -312,12 +338,12 @@ async def _check_and_notify(
     # (which spans an await) could let both send the same notification.
     async with lock:
         for t in tournaments:
-            days = (t.start_date - today).days
+            days = _days_until(t)
             if days > config.notify_days_ahead and not force_notify:
                 continue
 
             tid = _tournament_id(t)
-            text = _format_tournament_message(t, days)
+            text = _format_tournament_message(t)
             keyboard = _build_tournament_keyboard(t)
 
             for uid in config.allowed_user_ids:
