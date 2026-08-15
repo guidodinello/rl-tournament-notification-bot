@@ -183,3 +183,27 @@ poll_liquipedia()
 | External API | Claude.ai (unofficial) + YouTube | Liquipedia MediaWiki API |
 | Dependencies | curl-cffi, youtube-transcript-api | aiohttp, beautifulsoup4, lxml |
 | State | Upload queue (petition_queue.json) | Announcement dedup (announced.json) |
+
+---
+
+## /next ordering: sort by start time
+
+### Goal
+
+Make `/next` surface the earliest-starting tournament when several tournaments share the same date.
+
+### Change
+
+`fetch_upcoming_tournaments()` in `rltournamentbot/liquipedia.py` sorts upcoming tournaments by `start_time` (UTC) instead of `start_date` only:
+
+- Timed events sort by their precise `start_time`
+- Date-only events (Worlds/Majors, `start_time=None`) fall back to 23:59:59 UTC of their `start_date`, keeping them last among tournaments on the same day
+- `cmd_next` (bot.py:251) reads `tournaments[0]`, so the earliest-starting tournament is always shown first
+
+### Behavior
+
+| Scenario | Order |
+|---|---|
+| Multiple timed events on the same day | Earliest `start_time` first |
+| Timed + date-only events on the same day | Timed events first, date-only last |
+| Events on different days | Earlier `start_date` first (unchanged) |
