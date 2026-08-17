@@ -8,6 +8,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, TypedDict
 
+import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -20,8 +21,16 @@ from .config import Config
 from .liquipedia import fetch_upcoming_tournaments
 from .logger import get_logger
 from .models import Tournament
+from .twitch_drops import enrich_with_drops
 
 logger = get_logger(__name__)
+
+_DROPS_FAILURE_ALERT_THRESHOLD = 3
+
+
+class DropsHealth(TypedDict):
+    consecutive_failures: int
+    alerted: bool
 
 
 class BotData(TypedDict):
@@ -29,6 +38,7 @@ class BotData(TypedDict):
     chat_store: ChatStore
     announced: AnnouncedTracker
     notify_lock: asyncio.Lock
+    drops_health: DropsHealth
     _application: Application
 
 
@@ -39,6 +49,7 @@ _TYPE_ICONS = {
     "Major": "\U0001f30d",
     "Open": "\U0001f3b2",
     "Last Chance Qualifier": "\U0001f3aa",
+    "International Event": "\U0001f30e",
 }
 
 _TYPE_LABELS = {
@@ -46,6 +57,7 @@ _TYPE_LABELS = {
     "Major": "Major",
     "Open": "Opens",
     "Last Chance Qualifier": "Last Chance Qualifier",
+    "International Event": "Eventos Internacionales",
 }
 
 MONTHS_ES = [
@@ -128,6 +140,10 @@ def _format_tournament_message(t: Tournament) -> str:
 
     if time_str:
         lines.append(f"\U0001f552 Hora: {time_str} (GMT\u22123)")
+
+    if t.drops_campaign:
+        campaign = escape_markdown(t.drops_campaign, version=1)
+        lines.append(f"\U0001f381 Drops activos: {campaign}")
 
     return "\n".join(lines)
 
@@ -243,7 +259,7 @@ async def cmd_next(update: Update, context: CustomContext) -> None:
         return
 
     msg = await update.message.reply_text("Buscando pr\u00f3ximo torneo...")
-    tournaments = await fetch_upcoming_tournaments()
+    tournaments = await _fetch_tournaments(context.bot_data)
     if not tournaments:
         await msg.edit_text("No se encontraron torneos RLCS pr\u00f3ximos.")
         return
@@ -260,7 +276,7 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
         return
 
     msg = await update.message.reply_text("Cargando calendario...")
-    tournaments = await fetch_upcoming_tournaments()
+    tournaments = await _fetch_tournaments(context.bot_data)
     if not tournaments:
         await msg.edit_text("No se encontraron torneos RLCS pr\u00f3ximos.")
         return
@@ -271,7 +287,13 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
 
     lines: list[str] = ["\U0001f4cb *Pr\u00f3ximos torneos RLCS:*\n"]
 
-    type_order = ["World Championship", "Major", "Open", "Last Chance Qualifier"]
+    type_order = [
+        "World Championship",
+        "Major",
+        "Open",
+        "Last Chance Qualifier",
+        "International Event",
+    ]
 
     for event_type in type_order:
         group = groups.get(event_type)
@@ -292,11 +314,16 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
             when = f"{date_str} {time_str}h" if time_str else date_str
 
             if event_type in ("World Championship", "Major"):
-                lines.append(f"  \u2022 {region_safe} \u2014 {day_str} ({when})")
+                entry = f"  \u2022 {region_safe} \u2014 {day_str} ({when})"
             elif event_type == "Open":
-                lines.append(f"  \u2022 {t.mode} \u2014 {region_safe} \u2014 {day_str} ({when})")
+                entry = f"  \u2022 {t.mode} \u2014 {region_safe} \u2014 {day_str} ({when})"
             else:
-                lines.append(f"  \u2022 {region_safe} \u2014 {day_str} ({when})")
+                entry = f"  \u2022 {region_safe} \u2014 {day_str} ({when})"
+
+            if t.drops_campaign:
+                entry += f" \U0001f381 {escape_markdown(t.drops_campaign, version=1)}"
+
+            lines.append(entry)
 
         lines.append("")
 
@@ -309,12 +336,68 @@ async def cmd_refresh(update: Update, context: CustomContext) -> None:
         return
 
     await update.message.reply_text("Recargando datos desde Liquipedia...")
-    tournaments = await fetch_upcoming_tournaments()
+    tournaments = await _fetch_tournaments(context.bot_data)
     if tournaments:
         await update.message.reply_text(f"Listo. {len(tournaments)} torneo(s) encontrado(s).")
         await _check_and_notify(context.bot_data, tournaments, force_notify=False)
     else:
         await update.message.reply_text("No se encontraron torneos o hubo un error.")
+
+
+async def _track_drops_health(bot_data: BotData, had_failure: bool) -> None:
+    health = bot_data["drops_health"]
+    app = bot_data.get("_application")
+    chat_store = bot_data["chat_store"]
+    config = bot_data["config"]
+
+    if had_failure:
+        health["consecutive_failures"] += 1
+        if health["consecutive_failures"] < _DROPS_FAILURE_ALERT_THRESHOLD or health["alerted"]:
+            return
+        health["alerted"] = True
+        text = (
+            f"⚠️ El chequeo de Twitch Drops falló "
+            f"{health['consecutive_failures']} veces seguidas. Las notificaciones de "
+            f"torneos siguen funcionando normalmente, sin el dato de drops."
+        )
+    else:
+        was_alerted = health["alerted"]
+        health["consecutive_failures"] = 0
+        health["alerted"] = False
+        if not was_alerted:
+            return
+        text = "✅ El chequeo de Twitch Drops volvió a funcionar."
+
+    if app is None:
+        logger.warning("Application not ready yet; skipping drops health alert")
+        return
+
+    for uid in config.allowed_user_ids:
+        chat_id = chat_store.get_chat(uid)
+        if chat_id is None:
+            continue
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            logger.exception("Failed to send drops health alert to user %s", uid)
+
+
+async def _fetch_tournaments(bot_data: BotData) -> list[Tournament]:
+    tournaments = await fetch_upcoming_tournaments()
+    config = bot_data["config"]
+
+    if not config.twitch_drops_enabled or not tournaments:
+        return tournaments
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            tournaments, failures = await enrich_with_drops(tournaments, session)
+        await _track_drops_health(bot_data, failures > 0)
+    except Exception:
+        logger.exception("Twitch drops enrichment failed unexpectedly")
+        await _track_drops_health(bot_data, True)
+
+    return tournaments
 
 
 async def _check_and_notify(
@@ -383,7 +466,7 @@ async def _poll_task(app: Application, config: Config) -> None:
     while True:
         try:
             logger.info("Polling Liquipedia for new tournaments...")
-            tournaments = await fetch_upcoming_tournaments()
+            tournaments = await _fetch_tournaments(app.bot_data)
             if tournaments:
                 await _check_and_notify(app.bot_data, tournaments)
         except asyncio.CancelledError:
@@ -406,6 +489,7 @@ def build_application(config: Config, app: Application) -> Application:
     app.bot_data["chat_store"] = ChatStore(config.state_dir / "user_chats.json")
     app.bot_data["announced"] = AnnouncedTracker(config.state_dir / "announced.json")
     app.bot_data["notify_lock"] = asyncio.Lock()
+    app.bot_data["drops_health"] = DropsHealth(consecutive_failures=0, alerted=False)
     app.bot_data["_application"] = app
 
     app.add_handler(CommandHandler("start", cmd_start))
