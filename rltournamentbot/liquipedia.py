@@ -87,11 +87,16 @@ def _extract_region_url(col: Tag) -> tuple[str, str]:
     return region_url, region_name
 
 
-def _is_rlcs_event(heading_text: str) -> bool:
-    text = heading_text.lower()
-    if "rlcs" in text:
-        return True
-    return "last chance qualifier" in text
+def _extract_twitch_channels(scope: Tag) -> tuple[str, ...]:
+    channels: list[str] = []
+    for link in scope.find_all("a", href=True):
+        href = str(link["href"])
+        if "Special:Stream/twitch/" not in href:
+            continue
+        channel = href.rsplit("Special:Stream/twitch/", 1)[-1].split("?")[0].split("#")[0]
+        if channel and channel not in channels:
+            channels.append(channel)
+    return tuple(channels)
 
 
 def _is_skip_panel(heading_text: str) -> bool:
@@ -100,9 +105,23 @@ def _is_skip_panel(heading_text: str) -> bool:
     return any(s in text for s in skips)
 
 
-def _parse_worlds_or_major(heading: Tag, body: Tag | None, heading_text: str) -> list[Tournament]:
+def _is_under_international_events(panel: Tag) -> bool:
+    for ancestor in panel.find_parents("div", class_="panel-box"):
+        heading = ancestor.select_one(".panel-box-heading")
+        if heading and "international events" in heading.get_text(" ", strip=True).lower():
+            return True
+    return False
+
+
+def _parse_days_away_event(
+    heading: Tag, body: Tag | None, heading_text: str, event_type: str
+) -> list[Tournament]:
     name = heading_text.replace("\u2013", "-").replace("\u2014", "-").strip()
     name = " ".join(name.split())
+    # Strip the "N Days Away" suffix: it decrements daily, and _tournament_id
+    # (bot.py) is built from name+region+url, so leaving it in would change
+    # the id every day and re-trigger the notification throughout the window.
+    name = _DAYS_AWAY_RE.sub("", name).strip(" -\u2013\u2014").strip()
 
     start_date = _parse_days_away(heading_text)
     if not start_date:
@@ -110,16 +129,8 @@ def _parse_worlds_or_major(heading: Tag, body: Tag | None, heading_text: str) ->
 
     region = _extract_region_from_flag(heading)
 
-    url = RLCS_BASE
-    if body:
-        links = body.select("a[href]")
-        for link in links:
-            href = link["href"]
-            if href.startswith(RLCS_BASE):
-                url = href
-                break
-
-    event_type = "World Championship" if "World Championship" in name else "Major"
+    url = (_extract_url_from_lp_col(body) if body else None) or RLCS_BASE
+    twitch_channels = _extract_twitch_channels(body) if body else ()
 
     return [
         Tournament(
@@ -130,6 +141,7 @@ def _parse_worlds_or_major(heading: Tag, body: Tag | None, heading_text: str) ->
             liquipedia_url=url,
             event_type=event_type,
             mode="3v3",
+            twitch_channels=twitch_channels,
         )
     ]
 
@@ -159,6 +171,7 @@ def _parse_lcq(heading: Tag, body: Tag | None, heading_text: str) -> list[Tourna
                 event_type="Last Chance Qualifier",
                 mode="3v3",
                 start_time=start_dt,
+                twitch_channels=_extract_twitch_channels(col),
             )
         )
 
@@ -201,6 +214,7 @@ def _parse_opens(body: Tag | None, heading_text: str) -> list[Tournament]:
                         event_type="Open",
                         mode=mode,
                         start_time=start_dt,
+                        twitch_channels=_extract_twitch_channels(col),
                     )
                 )
 
@@ -217,22 +231,22 @@ def _parse_panel(panel: Tag) -> list[Tournament]:
     if _is_skip_panel(heading_text):
         return []
 
-    if not _is_rlcs_event(heading_text):
-        return []
-
     body = panel.select_one(".panel-box-body, .panel-box-collapsible-content")
 
     if "RLCS" in heading_text and "World Championship" in heading_text:
-        return _parse_worlds_or_major(heading, body, heading_text)
+        return _parse_days_away_event(heading, body, heading_text, "World Championship")
 
     if "RLCS" in heading_text and "Major" in heading_text:
-        return _parse_worlds_or_major(heading, body, heading_text)
+        return _parse_days_away_event(heading, body, heading_text, "Major")
 
     if "Last Chance Qualifier" in heading_text:
         return _parse_lcq(heading, body, heading_text)
 
     if "RLCS" in heading_text and "Opens" in heading_text:
         return _parse_opens(body, heading_text)
+
+    if _DAYS_AWAY_RE.search(heading_text) and _is_under_international_events(panel):
+        return _parse_days_away_event(heading, body, heading_text, "International Event")
 
     return []
 

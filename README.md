@@ -60,6 +60,7 @@ The bot can only push to chats it knows about. Any authorized interaction (e.g. 
 | `STATE_DIR` | No | `state` | Directory for persisted state (`announced.json`, `user_chats.json`) |
 | `LOG_LEVEL` | No | INFO | Logging level |
 | `LOG_FILE` | No | `logs/rlbot_<date>.log` | Log file path |
+| `TWITCH_DROPS_ENABLED` | No | `true` | Set to `false` to disable the Twitch Drops indicator (undocumented Twitch API; kill switch in case it breaks) |
 
 ## Project Structure
 
@@ -69,6 +70,7 @@ rltournamentbot/
 ├── logger.py       # Logging setup (stdout + rotating file)
 ├── models.py       # Tournament dataclass
 ├── liquipedia.py   # MediaWiki API client + BS4 HTML parser
+├── twitch_drops.py # Unauthenticated Twitch GraphQL client for the Drops indicator
 └── bot.py          # Telegram handlers, auth, notifications, poll loop
 main.py             # Entry point
 data/               # Raw HTML snapshots from Liquipedia
