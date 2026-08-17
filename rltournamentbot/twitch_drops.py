@@ -34,6 +34,9 @@ class TwitchDropsUnavailable(Exception):
     """
 
 
+_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
+
+
 async def _gql(session: aiohttp.ClientSession, query: dict, variables: dict) -> dict:
     payload = {
         "operationName": query["operationName"],
@@ -42,9 +45,14 @@ async def _gql(session: aiohttp.ClientSession, query: dict, variables: dict) -> 
             "persistedQuery": {"version": 1, "sha256Hash": query["sha256Hash"]},
         },
     }
-    async with session.post(TWITCH_GQL_URL, json=payload, headers=_HEADERS) as resp:
+    async with session.post(
+        TWITCH_GQL_URL, json=payload, headers=_HEADERS, timeout=_REQUEST_TIMEOUT
+    ) as resp:
         resp.raise_for_status()
-        return await resp.json()
+        data = await resp.json()
+        if "errors" in data:
+            raise TwitchDropsUnavailable(f"Twitch GQL returned errors: {data['errors']}")
+        return data
 
 
 async def _resolve_channel_id(session: aiohttp.ClientSession, channel_login: str) -> str | None:
@@ -55,7 +63,7 @@ async def _resolve_channel_id(session: aiohttp.ClientSession, channel_login: str
     return community["id"]
 
 
-async def get_active_drop_campaign(
+async def _get_active_drop_campaign_for_channel(
     session: aiohttp.ClientSession, channel_login: str
 ) -> str | None:
     try:
@@ -67,11 +75,29 @@ async def get_active_drop_campaign(
         campaigns = data["data"]["channel"]["viewerDropCampaigns"]
         if not campaigns:
             return None
-        return campaigns[0]["name"]
+        # The persisted query's response schema isn't publicly documented and
+        # we have no verified way to tell which of several concurrent
+        # campaigns (e.g. an always-on one plus an event-specific one) is
+        # actually relevant, or whether ordering is meaningful. Rather than
+        # guess at an index, surface every named campaign so nothing gets
+        # silently misattributed to the wrong one.
+        names = dict.fromkeys(c["name"] for c in campaigns if c.get("name"))
+        return ", ".join(names) or None
     except TwitchDropsUnavailable:
         raise
     except Exception as e:
         raise TwitchDropsUnavailable(f"Twitch drops check failed for {channel_login!r}: {e}") from e
+
+
+async def get_active_drop_campaign(
+    session: aiohttp.ClientSession, channel_logins: tuple[str, ...]
+) -> str | None:
+    """Check every channel and return the first campaign found, if any."""
+    for channel_login in channel_logins:
+        campaign = await _get_active_drop_campaign_for_channel(session, channel_login)
+        if campaign:
+            return campaign
+    return None
 
 
 async def enrich_with_drops(
@@ -86,7 +112,7 @@ async def enrich_with_drops(
             continue
 
         try:
-            campaign = await get_active_drop_campaign(session, t.twitch_channels[0])
+            campaign = await get_active_drop_campaign(session, t.twitch_channels)
             enriched.append(dataclasses.replace(t, drops_campaign=campaign))
         except TwitchDropsUnavailable:
             logger.warning("Twitch drops check failed for %s", t.name, exc_info=True)

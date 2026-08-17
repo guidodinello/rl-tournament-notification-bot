@@ -105,11 +105,23 @@ def _is_skip_panel(heading_text: str) -> bool:
     return any(s in text for s in skips)
 
 
+def _is_under_international_events(panel: Tag) -> bool:
+    for ancestor in panel.find_parents("div", class_="panel-box"):
+        heading = ancestor.select_one(".panel-box-heading")
+        if heading and "international events" in heading.get_text(" ", strip=True).lower():
+            return True
+    return False
+
+
 def _parse_days_away_event(
     heading: Tag, body: Tag | None, heading_text: str, event_type: str
 ) -> list[Tournament]:
     name = heading_text.replace("\u2013", "-").replace("\u2014", "-").strip()
     name = " ".join(name.split())
+    # Strip the "N Days Away" suffix: it decrements daily, and _tournament_id
+    # (bot.py) is built from name+region+url, so leaving it in would change
+    # the id every day and re-trigger the notification throughout the window.
+    name = _DAYS_AWAY_RE.sub("", name).strip(" -\u2013\u2014").strip()
 
     start_date = _parse_days_away(heading_text)
     if not start_date:
@@ -233,7 +245,7 @@ def _parse_panel(panel: Tag) -> list[Tournament]:
     if "RLCS" in heading_text and "Opens" in heading_text:
         return _parse_opens(body, heading_text)
 
-    if _DAYS_AWAY_RE.search(heading_text):
+    if _DAYS_AWAY_RE.search(heading_text) and _is_under_international_events(panel):
         return _parse_days_away_event(heading, body, heading_text, "International Event")
 
     return []
