@@ -35,10 +35,11 @@ async def main_async(config: Config) -> None:
                 # Cancelling every sibling task here raises CancelledError inside each --
                 # TaskGroup excludes that from the ExceptionGroup below, so a
                 # signal-triggered shutdown exits main_async cleanly. A genuine subsystem
-                # failure (e.g. a Telegram "Conflict: terminated by other getUpdates
-                # request" right after a redeploy) is a real exception, which TaskGroup
-                # turns into cross-cancellation of the siblings and an ExceptionGroup --
-                # no manual handling needed for that case either.
+                # failure (e.g. app.start()/get_me()/delete_webhook failing during
+                # bootstrap -- getUpdates itself is retried indefinitely by PTB's own
+                # network_retry_loop and never reaches here) is a real exception, which
+                # TaskGroup turns into cross-cancellation of the siblings and an
+                # ExceptionGroup -- no manual handling needed for that case either.
                 logger.info("Shutdown signal received, stopping...")
                 for t in tasks:
                     t.cancel()
