@@ -22,21 +22,37 @@ async def main_async(config: Config) -> None:
 
     build_application(config, app)
 
-    tasks = [asyncio.create_task(_run_polling(app))]
-    tasks.append(asyncio.create_task(_poll_task(app, config)))
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tasks = [
+                tg.create_task(_run_polling(app)),
+                tg.create_task(_poll_task(app, config)),
+            ]
 
-    loop = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
 
-    def _shutdown():
-        logger.info("Shutdown signal received, stopping...")
-        for t in tasks:
-            t.cancel()
+            def _shutdown() -> None:
+                # Cancelling every sibling task here raises CancelledError inside each --
+                # TaskGroup excludes that from the ExceptionGroup below, so a
+                # signal-triggered shutdown exits main_async cleanly. A genuine subsystem
+                # failure (e.g. app.start()/get_me()/delete_webhook failing during
+                # bootstrap -- getUpdates itself is retried indefinitely by PTB's own
+                # network_retry_loop and never reaches here) is a real exception, which
+                # TaskGroup turns into cross-cancellation of the siblings and an
+                # ExceptionGroup -- no manual handling needed for that case either.
+                logger.info("Shutdown signal received, stopping...")
+                for t in tasks:
+                    t.cancel()
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, _shutdown)
-
-    await asyncio.gather(*tasks, return_exceptions=True)
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                with contextlib.suppress(NotImplementedError):
+                    loop.add_signal_handler(sig, _shutdown)
+    except* Exception as eg:
+        # Previously this used asyncio.gather(..., return_exceptions=True) and never
+        # inspected the results -- a crash here went completely unlogged while the sibling
+        # task kept running, leaving the bot looking alive but silently unresponsive.
+        logger.error("Essential subsystem failed -- shutting down", exc_info=eg)
+        raise
 
 
 async def _run_polling(app) -> None:
