@@ -75,13 +75,15 @@ async def _get_active_drop_campaign_for_channel(
         campaigns = data["data"]["channel"]["viewerDropCampaigns"]
         if not campaigns:
             return None
-        # The persisted query's response schema isn't publicly documented and
-        # we have no verified way to tell which of several concurrent
-        # campaigns (e.g. an always-on one plus an event-specific one) is
-        # actually relevant, or whether ordering is meaningful. Rather than
-        # guess at an index, surface every named campaign so nothing gets
-        # silently misattributed to the wrong one.
-        names = dict.fromkeys(c["name"] for c in campaigns if c.get("name"))
+        # Sitewide campaigns (e.g. generic "subscribe to earn drops" reward
+        # drives) aren't specific to this channel's event -- verified live
+        # against a real populated response, they carry
+        # summary.isSitewide=True and an unrelated game (e.g. "Special
+        # Events"). Excluding those leaves only channel/event-targeted
+        # campaigns. There's still no verified relevance/ordering field
+        # among the remainder, so surface every name rather than guess.
+        relevant = [c for c in campaigns if not c.get("summary", {}).get("isSitewide")]
+        names = dict.fromkeys(c["name"] for c in relevant if c.get("name"))
         return ", ".join(names) or None
     except TwitchDropsUnavailable:
         raise
