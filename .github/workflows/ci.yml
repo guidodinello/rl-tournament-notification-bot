@@ -1,0 +1,34 @@
+# Baseline from guidodinello/dev-standards (templates/ci/python-ci.yml).
+#
+# No "Tests (Python)" job yet — this repo has no test suite. Add one (pytest
+# as a dev dependency, a tests/ directory) then bring that job back from the
+# template and add its context to required_status_checks in github-standard.json.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: ruff format check
+        run: uv run ruff format --check .
+
+      - name: ruff lint
+        run: uv run ruff check .
