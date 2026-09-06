@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 import asyncio
 import json
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, TypedDict
@@ -122,14 +120,35 @@ def _build_tournament_keyboard(t: Tournament) -> InlineKeyboardMarkup:
     )
 
 
-def _format_tournament_message(t: Tournament) -> str:
+def _build_multi_tournament_keyboard(tournaments: list[Tournament]) -> InlineKeyboardMarkup:
+    rows = []
+    for t in tournaments:
+        full_url = f"https://liquipedia.net{t.liquipedia_url}"
+        rows.append([InlineKeyboardButton(f"Ver {t.region} en Liquipedia", url=full_url)])
+    return InlineKeyboardMarkup(rows)
+
+
+def _is_live(t: Tournament) -> bool:
+    # Date-only events (Worlds/Majors parsed from "N Days Away") have no
+    # start_time, so we can't know if they've started -- never mark them live.
+    if t.start_time is None:
+        return False
+    return datetime.now(UTC) >= t.start_time
+
+
+def _format_tournament_message(t: Tournament, *, live: bool = False) -> str:
     icon = _TYPE_ICONS.get(t.event_type, "\U0001f3c6")
     mode_tag = f" [{t.mode}]" if t.mode else ""
     name = f"{icon} *{escape_markdown(t.name, version=1)}*{mode_tag}"
     local_date, time_str = _local_date_and_time(t)
     days_left = _days_until(t)
     date_str = _format_date(local_date)
-    day_str = f"\U0001f4c5 *{days_left} d\u00edas*" if days_left > 0 else "\U0001f4c5 \u00a1Hoy!"
+    if live:
+        day_str = "\U0001f534 EN VIVO"
+    elif days_left > 0:
+        day_str = f"\U0001f4c5 *{days_left} d\u00edas*"
+    else:
+        day_str = "\U0001f4c5 \u00a1Hoy!"
 
     lines = [
         name,
@@ -144,6 +163,28 @@ def _format_tournament_message(t: Tournament) -> str:
     if t.drops_campaign:
         campaign = escape_markdown(t.drops_campaign, version=1)
         lines.append(f"\U0001f381 Drops activos: {campaign}")
+
+    return "\n".join(lines)
+
+
+def _format_short_tournament(t: Tournament, *, live: bool = False) -> str:
+    icon = "\U0001f534" if live else _TYPE_ICONS.get(t.event_type, "\U0001f3c6")
+    mode_tag = f" [{t.mode}]" if t.mode else ""
+    name = f"{icon} *{escape_markdown(t.name, version=1)}*{mode_tag}"
+    _, time_str = _local_date_and_time(t)
+
+    lines = [
+        name,
+        f"   \U0001f30d Regi\u00f3n: {t.region}",
+    ]
+
+    if time_str:
+        time_line = f"   \U0001f552 {time_str} (GMT\u22123)"
+        if live:
+            time_line += " \u2014 \U0001f534 EN VIVO"
+        lines.append(time_line)
+    elif live:
+        lines.append("   \U0001f534 EN VIVO")
 
     return "\n".join(lines)
 
@@ -264,9 +305,34 @@ async def cmd_next(update: Update, context: CustomContext) -> None:
         await msg.edit_text("No se encontraron torneos RLCS pr\u00f3ximos.")
         return
 
-    next_t = tournaments[0]
-    text = _format_tournament_message(next_t)
-    keyboard = _build_tournament_keyboard(next_t)
+    groups: dict[int, list[Tournament]] = {}
+    for t in tournaments:
+        # Clamp to 0 so a still-running event whose local calendar date has
+        # already ticked over to "yesterday" (e.g. started late UTC, near
+        # midnight UY-local) still groups with today instead of vanishing
+        # into its own single-item "past" bucket.
+        groups.setdefault(max(_days_until(t), 0), []).append(t)
+
+    min_days = min(groups.keys())
+    next_group = groups[min_days]
+
+    if len(next_group) == 1 and min_days > 0:
+        # Single future tournament -- keep the existing single-item format.
+        text = _format_tournament_message(next_group[0], live=False)
+        keyboard = _build_tournament_keyboard(next_group[0])
+    else:
+        # Multiple tournaments, or tournaments starting today -- grouped list.
+        header_date = datetime.now(UY_TZ).date() + timedelta(days=min_days)
+        date_str = _format_date(header_date)
+
+        lines = [f"\U0001f4c5 *Pr\u00f3ximos torneos \u2014 {date_str}*\n"]
+        for t in next_group:
+            lines.append(_format_short_tournament(t, live=_is_live(t)))
+            lines.append("")
+
+        text = "\n".join(lines)
+        keyboard = _build_multi_tournament_keyboard(next_group)
+
     await msg.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
@@ -309,7 +375,10 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
             local_date, time_str = _local_date_and_time(t)
             date_str = _format_date(local_date)
             region_safe = escape_markdown(t.region, version=1)
-            day_str = f"{days} d\u00edas" if days > 0 else "\u00a1Hoy!"
+            if _is_live(t):
+                day_str = "\U0001f534 EN VIVO"
+            else:
+                day_str = f"{days} d\u00edas" if days > 0 else "\u00a1Hoy!"
 
             when = f"{date_str} {time_str}h" if time_str else date_str
 
@@ -426,7 +495,7 @@ async def _check_and_notify(
                 continue
 
             tid = _tournament_id(t)
-            text = _format_tournament_message(t)
+            text = _format_tournament_message(t, live=_is_live(t))
             keyboard = _build_tournament_keyboard(t)
 
             for uid in config.allowed_user_ids:
