@@ -36,10 +36,10 @@ async def main_async(config: Config) -> None:
                 # TaskGroup excludes that from the ExceptionGroup below, so a
                 # signal-triggered shutdown exits main_async cleanly. A genuine subsystem
                 # failure (e.g. app.start()/get_me()/delete_webhook failing during
-                # bootstrap -- getUpdates itself is retried indefinitely by PTB's own
-                # network_retry_loop and never reaches here) is a real exception, which
-                # TaskGroup turns into cross-cancellation of the siblings and an
-                # ExceptionGroup -- no manual handling needed for that case either.
+                # bootstrap, or PTB's getUpdates loop giving up -- see _run_polling) is a
+                # real exception, which TaskGroup turns into cross-cancellation of the
+                # siblings and an ExceptionGroup -- no manual handling needed for that
+                # case either.
                 logger.info("Shutdown signal received, stopping...")
                 for t in tasks:
                     t.cancel()
@@ -55,15 +55,49 @@ async def main_async(config: Config) -> None:
         raise
 
 
+_POLLING_TASK_NAME = "Updater:start_polling:polling_task"
+
+
+class PollingStoppedError(RuntimeError):
+    """PTB's getUpdates loop ended on its own while the bot was meant to be running."""
+
+
+def _find_polling_task() -> asyncio.Task:
+    # PTB runs getUpdates in a background task it never exposes publicly, but it
+    # gives it a stable name. Without a handle on it, nothing notices when it dies.
+    for task in asyncio.all_tasks():
+        if task.get_name() == _POLLING_TASK_NAME:
+            return task
+    raise RuntimeError(f"Could not find PTB polling task {_POLLING_TASK_NAME!r}")
+
+
 async def _run_polling(app) -> None:
     async with app:
         await app.updater.start_polling()
-        await app.start()
         try:
-            await asyncio.Event().wait()
+            await app.start()
+            # Wait on the getUpdates loop itself rather than forever. PTB retries most
+            # errors indefinitely, but aborts the loop on InvalidToken -- which Telegram
+            # also triggers with a transient 401/404 -- and nothing else awaits that
+            # task. The process then stayed up (the Liquipedia poll kept running) while
+            # never receiving another command. Raising here lets TaskGroup tear down and
+            # exit, so Docker's restart policy brings the bot back.
+            polling_task = _find_polling_task()
+            # asyncio.wait neither raises the task's error nor cancels it when we're
+            # cancelled for shutdown -- updater.stop() below winds it down then.
+            await asyncio.wait({polling_task})
+            exc = None if polling_task.cancelled() else polling_task.exception()
+            raise PollingStoppedError("Telegram polling stopped unexpectedly") from exc
         finally:
-            await app.updater.stop()
-            await app.stop()
+            if app.updater.running:
+                try:
+                    # Re-raises the polling task's error if it died; it's already been
+                    # chained onto PollingStoppedError, so don't let it mask that.
+                    await app.updater.stop()
+                except Exception:
+                    get_logger(__name__).exception("Error while stopping Telegram updater")
+            if app.running:
+                await app.stop()
 
 
 def main() -> None:
