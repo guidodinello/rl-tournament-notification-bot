@@ -15,6 +15,7 @@ USER_AGENT = "RLTournamentBot/1.0 (https://github.com/guido/rl-tournament-bot)"
 RLCS_BASE = "/rocketleague/Rocket_League_Championship_Series"
 
 _DAYS_AWAY_RE = re.compile(r"(\d+)\s*Days?\s*Away", re.IGNORECASE)
+_3V3_CHAMPION_RE = re.compile(r"3v3\s+Champions?\b", re.IGNORECASE)
 
 
 async def _fetch_page_html(session: aiohttp.ClientSession, page: str) -> str:
@@ -113,6 +114,13 @@ def _is_under_international_events(panel: Tag) -> bool:
     return False
 
 
+def _has_3v3_champion(body: Tag) -> bool:
+    return any(
+        _3V3_CHAMPION_RE.search(h.get_text(" ", strip=True))
+        for h in body.select(".panel-box-heading")
+    )
+
+
 def _parse_days_away_event(
     heading: Tag, body: Tag | None, heading_text: str, event_type: str
 ) -> list[Tournament]:
@@ -125,6 +133,13 @@ def _parse_days_away_event(
 
     start_date = _parse_days_away(heading_text)
     if not start_date:
+        # No countdown means the event is running or already over. Liquipedia
+        # keeps a finished event's panel (with a "3v3 Champions" result) until
+        # the next season is listed; without this check it would show up in
+        # /next as starting today for weeks. 1v1/2v2 finals can wrap up while
+        # the 3v3 event is still live, so only the 3v3 result counts.
+        if body and _has_3v3_champion(body):
+            return []
         start_date = date.today()
 
     region = _extract_region_from_flag(heading)
