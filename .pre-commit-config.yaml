@@ -1,3 +1,7 @@
+# data/ holds raw Liquipedia responses kept byte-for-byte for change tracking
+# (see README); hooks must not rewrite them.
+exclude: ^data/
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
