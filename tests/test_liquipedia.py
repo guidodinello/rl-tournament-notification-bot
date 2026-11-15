@@ -47,7 +47,7 @@ class TestClubChampionship2027:
         assert not self.result.blind
 
     def test_headline_event(self):
-        (event,) = [t for t in self.result.tournaments if t.event_type == "Championship"]
+        (event,) = (t for t in self.result.tournaments if t.event_type == "Championship")
         assert event.name == "RLCS 2027: Club Championship - Kick-Off"
         assert event.start_date == date(2026, 12, 9)  # "24 Days Away"
         assert event.region == "England"
@@ -141,7 +141,7 @@ class TestFutureLayouts:
         cols = _region_col("Europe", SOON) + _region_col("Oceania", None)
         html = _page(_panel("RLCS 2028: Grand Prix", _panel("Grand Prix - Play-Ins", cols)))
         result = parse_tournaments(html, today=TODAY)
-        (play_in,) = [t for t in result.tournaments if t.event_type == "Qualifier"]
+        (play_in,) = (t for t in result.tournaments if t.event_type == "Qualifier")
         assert play_in.name == "RLCS 2028 Grand Prix - Play-Ins — Europe"
         assert play_in.start_time == SOON
         assert result.unrecognized == ()
