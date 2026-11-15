@@ -34,6 +34,14 @@ Pre-commit runs Ruff linter and formatter on every commit. To run on all files:
 uv run pre-commit run --all-files
 ```
 
+Run the tests with:
+
+```bash
+uv run pytest
+```
+
+The parser tests run against saved copies of the Liquipedia page in `tests/fixtures/`. When Liquipedia changes its layout, add the new page there with a test for what it should yield.
+
 ## Commands
 
 | Command | Description |
@@ -46,6 +54,8 @@ uv run pre-commit run --all-files
 ## Notifications
 
 The bot polls Liquipedia every `POLL_INTERVAL_MINUTES` (default 60). When a tournament is starting within `NOTIFY_DAYS_AHEAD` days, it sends a notification with event details and a "Ver en Liquipedia" link. A tournament is recorded as announced (in `<STATE_DIR>/announced.json`) only after the message is successfully delivered, so a missing chat or a transient failure does not permanently suppress it.
+
+Events are read from the page by structure rather than by exact title: a top-level `RLCS <year>: …` panel is a headline event (World Championship, Major, Club Championship, …), and any RLCS panel with a start timer per region column is a set of regional tournaments (Opens, Last Chance Qualifier, …). If a panel looks like an event but can't be read — or nothing on the page can — the bot sends a one-time "Liquipedia cambió de formato" warning instead of going quiet, and a follow-up once it reads the page again.
 
 The bot can only push to chats it knows about. Any authorized interaction (e.g. `/next`, `/start`) registers your chat in `<STATE_DIR>/user_chats.json`. Keep `STATE_DIR` on a persistent volume so this survives restarts — the included `deploy.sh` mounts the `rlbot-data` Docker volume at `/app/state` for this.
 
@@ -74,6 +84,7 @@ rltournamentbot/
 └── bot.py          # Telegram handlers, auth, notifications, poll loop
 main.py             # Entry point
 data/               # Raw HTML snapshots from Liquipedia
+tests/              # pytest suite + Liquipedia page fixtures
 ```
 
 ## Data Source

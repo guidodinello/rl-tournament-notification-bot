@@ -16,7 +16,7 @@ from telegram.ext import (
 from telegram.helpers import escape_markdown
 
 from .config import Config
-from .liquipedia import fetch_upcoming_tournaments
+from .liquipedia import ParseResult, fetch_upcoming_tournaments
 from .logger import get_logger
 from .models import Tournament
 from .twitch_drops import enrich_with_drops
@@ -24,11 +24,19 @@ from .twitch_drops import enrich_with_drops
 logger = get_logger(__name__)
 
 _DROPS_FAILURE_ALERT_THRESHOLD = 3
+# Stand-in "problem" for a page on which no panel at all was recognized.
+_PARSER_BLIND = "<blind>"
 
 
 class DropsHealth(TypedDict):
     consecutive_failures: int
     alerted: bool
+
+
+class ParserHealth(TypedDict):
+    # The problem we last alerted about (unrecognized panel headings, or a
+    # marker for "nothing recognized at all"); None while the parser is healthy.
+    alerted_for: tuple[str, ...] | None
 
 
 class BotData(TypedDict):
@@ -37,6 +45,7 @@ class BotData(TypedDict):
     announced: AnnouncedTracker
     notify_lock: asyncio.Lock
     drops_health: DropsHealth
+    parser_health: ParserHealth
     _application: Application
 
 
@@ -45,16 +54,20 @@ CustomContext = CallbackContext[Any, dict, dict, BotData]
 _TYPE_ICONS = {
     "World Championship": "\U0001f3c6",
     "Major": "\U0001f30d",
+    "Championship": "\U0001f3c5",
     "Open": "\U0001f3b2",
     "Last Chance Qualifier": "\U0001f3aa",
+    "Qualifier": "\U0001f39f",
     "International Event": "\U0001f30e",
 }
 
 _TYPE_LABELS = {
     "World Championship": "World Championship",
     "Major": "Major",
+    "Championship": "Championship",
     "Open": "Opens",
     "Last Chance Qualifier": "Last Chance Qualifier",
+    "Qualifier": "Clasificatorios",
     "International Event": "Eventos Internacionales",
 }
 
@@ -356,10 +369,14 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
     type_order = [
         "World Championship",
         "Major",
+        "Championship",
         "Open",
         "Last Chance Qualifier",
+        "Qualifier",
         "International Event",
     ]
+    # A type the parser starts emitting later must still be listed.
+    type_order += [et for et in groups if et not in type_order]
 
     for event_type in type_order:
         group = groups.get(event_type)
@@ -369,6 +386,8 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
         icon = _TYPE_ICONS.get(event_type, "\U0001f3c6")
         label = _TYPE_LABELS.get(event_type, event_type)
         lines.append(f"{icon} *{label}*")
+        # 3v3 is the default format; only spell the mode out when it varies.
+        show_mode = any(t.mode not in (None, "3v3") for t in group)
 
         for t in group:
             days = _days_until(t)
@@ -382,9 +401,7 @@ async def cmd_schedule(update: Update, context: CustomContext) -> None:
 
             when = f"{date_str} {time_str}h" if time_str else date_str
 
-            if event_type in ("World Championship", "Major"):
-                entry = f"  \u2022 {region_safe} \u2014 {day_str} ({when})"
-            elif event_type == "Open":
+            if show_mode:
                 entry = f"  \u2022 {t.mode} \u2014 {region_safe} \u2014 {day_str} ({when})"
             else:
                 entry = f"  \u2022 {region_safe} \u2014 {day_str} ({when})"
@@ -415,9 +432,6 @@ async def cmd_refresh(update: Update, context: CustomContext) -> None:
 
 async def _track_drops_health(bot_data: BotData, had_failure: bool) -> None:
     health = bot_data["drops_health"]
-    app = bot_data.get("_application")
-    chat_store = bot_data["chat_store"]
-    config = bot_data["config"]
 
     if had_failure:
         health["consecutive_failures"] += 1
@@ -437,23 +451,76 @@ async def _track_drops_health(bot_data: BotData, had_failure: bool) -> None:
             return
         text = "✅ El chequeo de Twitch Drops volvió a funcionar."
 
-    if app is None:
-        logger.warning("Application not ready yet; skipping drops health alert")
+    await _broadcast(bot_data, text)
+
+
+async def _track_parser_health(bot_data: BotData, result: ParseResult) -> None:
+    """Tell the users when Liquipedia's layout outgrows the parser.
+
+    Without this the bot just goes quiet: an unreadable page looks exactly
+    like "no upcoming tournaments".
+    """
+    if not result.fetched:
         return
 
-    for uid in config.allowed_user_ids:
-        chat_id = chat_store.get_chat(uid)
+    health = bot_data["parser_health"]
+    problem: tuple[str, ...] | None = None
+    if result.blind:
+        problem = (_PARSER_BLIND,)
+    elif result.unrecognized:
+        problem = tuple(sorted(result.unrecognized))
+
+    if problem == health["alerted_for"]:
+        return
+
+    if problem is None:
+        text = "\u2705 Volv\u00ed a leer bien la p\u00e1gina de eventos de Liquipedia."
+    elif result.blind:
+        text = (
+            "\u26a0\ufe0f Liquipedia cambi\u00f3 de formato: no pude leer ning\u00fan torneo "
+            "de la p\u00e1gina de eventos. No voy a poder avisarte hasta que se "
+            "actualice el bot."
+        )
+    else:
+        panels = ", ".join(f"\u00ab{h}\u00bb" for h in problem)
+        text = (
+            f"\u26a0\ufe0f Liquipedia cambi\u00f3 de formato: no pude leer {panels}. "
+            "Puede que falten avisos de esos torneos hasta que se actualice el bot."
+        )
+
+    if await _broadcast(bot_data, text):
+        health["alerted_for"] = problem
+
+
+async def _broadcast(bot_data: BotData, text: str) -> bool:
+    """Send a plain-text notice to every allowed user; True if anyone got it."""
+    app = bot_data.get("_application")
+    if app is None:
+        logger.warning("Application not ready yet; skipping notice: %s", text)
+        return False
+
+    delivered = False
+    for uid in bot_data["config"].allowed_user_ids:
+        chat_id = bot_data["chat_store"].get_chat(uid)
         if chat_id is None:
             continue
         try:
             await app.bot.send_message(chat_id=chat_id, text=text)
+            delivered = True
         except Exception:
-            logger.exception("Failed to send drops health alert to user %s", uid)
+            logger.exception("Failed to send notice to user %s", uid)
+    return delivered
 
 
 async def _fetch_tournaments(bot_data: BotData) -> list[Tournament]:
-    tournaments = await fetch_upcoming_tournaments()
+    result = await fetch_upcoming_tournaments()
+    tournaments = result.tournaments
     config = bot_data["config"]
+
+    try:
+        await _track_parser_health(bot_data, result)
+    except Exception:
+        logger.exception("Parser health check failed unexpectedly")
 
     if not config.twitch_drops_enabled or not tournaments:
         return tournaments
@@ -559,6 +626,7 @@ def build_application(config: Config, app: Application) -> Application:
     app.bot_data["announced"] = AnnouncedTracker(config.state_dir / "announced.json")
     app.bot_data["notify_lock"] = asyncio.Lock()
     app.bot_data["drops_health"] = DropsHealth(consecutive_failures=0, alerted=False)
+    app.bot_data["parser_health"] = ParserHealth(alerted_for=None)
     app.bot_data["_application"] = app
 
     app.add_handler(CommandHandler("start", cmd_start))

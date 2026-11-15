@@ -14,7 +14,11 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pre-commit>=4.0.0", "ruff>=0.15.18"]
+dev = [
+    "pre-commit>=4.0.0",
+    "pytest>=9.2.0",
+    "ruff>=0.15.18",
+]
 
 [build-system]
 requires = ["hatchling"]
