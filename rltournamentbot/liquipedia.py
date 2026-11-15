@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -15,7 +16,12 @@ USER_AGENT = "RLTournamentBot/1.0 (https://github.com/guido/rl-tournament-bot)"
 RLCS_BASE = "/rocketleague/Rocket_League_Championship_Series"
 
 _DAYS_AWAY_RE = re.compile(r"(\d+)\s*Days?\s*Away", re.IGNORECASE)
-_3V3_CHAMPION_RE = re.compile(r"3v3\s+Champions?\b", re.IGNORECASE)
+_CHAMPION_RE = re.compile(r"\bChampions?\b", re.IGNORECASE)
+_SIDE_MODE_RE = re.compile(r"\b[12]v[12]\b", re.IGNORECASE)
+_MODE_RE = re.compile(r"\dv\d", re.IGNORECASE)
+_RLCS_YEAR_RE = re.compile(r"\bRLCS\s+(\d{4})\b")
+_RLCS_PREFIX_RE = re.compile(r"^\s*RLCS(\s+\d{4})?\s*:?\s*")
+_TAB_CONTENT_RE = re.compile(r"content(\d+)$")
 
 
 async def _fetch_page_html(session: aiohttp.ClientSession, page: str) -> str:
@@ -31,10 +37,10 @@ async def _fetch_page_html(session: aiohttp.ClientSession, page: str) -> str:
         return data["parse"]["text"]["*"]
 
 
-def _parse_days_away(text: str) -> date | None:
+def _parse_days_away(text: str, today: date) -> date | None:
     m = _DAYS_AWAY_RE.search(text)
     if m:
-        return date.today() + timedelta(days=int(m.group(1)))
+        return today + timedelta(days=int(m.group(1)))
     return None
 
 
@@ -88,9 +94,22 @@ def _extract_region_url(col: Tag) -> tuple[str, str]:
     return region_url, region_name
 
 
-def _extract_twitch_channels(scope: Tag) -> tuple[str, ...]:
+def _in_timer_col(tag: Tag) -> bool:
+    return any(
+        col.select_one(".timer-object[data-timestamp]")
+        for col in tag.find_parents(["lp-col", "div"])
+        if col.name == "lp-col" or "lp-col" in col.get("class", [])
+    )
+
+
+def _extract_twitch_channels(scope: Tag, *, skip_timer_cols: bool = False) -> tuple[str, ...]:
+    # skip_timer_cols leaves out the streams of region columns that have their
+    # own start timer: those belong to that region's tournament (e.g. a
+    # community cast of one regional Open), not to the event they sit under.
     channels: list[str] = []
     for link in scope.find_all("a", href=True):
+        if skip_timer_cols and _in_timer_col(link):
+            continue
         href = str(link["href"])
         if "Special:Stream/twitch/" not in href:
             continue
@@ -100,52 +119,108 @@ def _extract_twitch_channels(scope: Tag) -> tuple[str, ...]:
     return tuple(channels)
 
 
+# Panels we know about and deliberately ignore: rosters/results sub-panels,
+# the "International Events" container (its children are handled one by one),
+# and non-RLCS circuits. Anything else that looks like an event but matches no
+# rule is reported as unrecognized instead of being dropped silently.
+_SKIP_HEADINGS = ("3v3 teams", "2v2 finals", "international events", "collegiate")
+
+
 def _is_skip_panel(heading_text: str) -> bool:
     text = heading_text.lower()
-    skips = ["3v3 teams", "2v2 finals", "international events"]
-    return any(s in text for s in skips)
+    return any(s in text for s in _SKIP_HEADINGS)
+
+
+def _clean_text(tag: Tag) -> str:
+    # split() also collapses the non-breaking spaces Liquipedia uses in titles.
+    return " ".join(tag.get_text(" ", strip=True).split())
+
+
+def _heading_text(panel: Tag) -> str:
+    heading = panel.select_one(".panel-box-heading")
+    return _clean_text(heading) if heading else ""
+
+
+def _is_top_level(panel: Tag) -> bool:
+    return panel.find_parent("div", class_="panel-box") is None
 
 
 def _is_under_international_events(panel: Tag) -> bool:
-    for ancestor in panel.find_parents("div", class_="panel-box"):
-        heading = ancestor.select_one(".panel-box-heading")
-        if heading and "international events" in heading.get_text(" ", strip=True).lower():
+    return any(
+        "international events" in _heading_text(ancestor).lower()
+        for ancestor in panel.find_parents("div", class_="panel-box")
+    )
+
+
+def _rlcs_season(panel: Tag) -> tuple[bool, str | None]:
+    """Whether the panel belongs to an RLCS panel tree, and that season's year."""
+    in_rlcs = False
+    for p in [panel, *panel.find_parents("div", class_="panel-box")]:
+        text = _heading_text(p)
+        m = _RLCS_YEAR_RE.search(text)
+        if m:
+            return True, m.group(1)
+        if "RLCS" in text:
+            in_rlcs = True
+    return in_rlcs, None
+
+
+def _own(panel: Tag, tags: list[Tag]) -> list[Tag]:
+    """Keep only the tags that belong to this panel, not to a nested one."""
+    return [t for t in tags if t.find_parent("div", class_="panel-box") is panel]
+
+
+def _own_timer_cols(scope: Tag, panel: Tag) -> list[tuple[Tag, datetime]]:
+    cols: list[tuple[Tag, datetime]] = []
+    for col in _own(panel, _get_lp_cols(scope)):
+        timer = col.select_one(".timer-object[data-timestamp]")
+        start_dt = _parse_datetime(timer["data-timestamp"]) if timer else None
+        if start_dt:
+            cols.append((col, start_dt))
+    return cols
+
+
+def _is_finished(body: Tag) -> bool:
+    # A nested "... Champions" result panel marks the event as over. 1v1/2v2
+    # finals can wrap up while the main event is still live, so those don't count.
+    for h in body.select(".panel-box-heading"):
+        text = h.get_text(" ", strip=True)
+        if _CHAMPION_RE.search(text) and not _SIDE_MODE_RE.search(text):
             return True
     return False
 
 
-def _has_3v3_champion(body: Tag) -> bool:
-    return any(
-        _3V3_CHAMPION_RE.search(h.get_text(" ", strip=True))
-        for h in body.select(".panel-box-heading")
-    )
+def _headline_event_type(heading_text: str) -> str:
+    for keyword in ("World Championship", "Major"):
+        if keyword in heading_text:
+            return keyword
+    return "Championship"
 
 
 def _parse_days_away_event(
-    heading: Tag, body: Tag | None, heading_text: str, event_type: str
+    heading: Tag, body: Tag | None, heading_text: str, event_type: str, today: date
 ) -> list[Tournament]:
-    name = heading_text.replace("\u2013", "-").replace("\u2014", "-").strip()
+    name = heading_text.replace("–", "-").replace("—", "-").strip()
     name = " ".join(name.split())
     # Strip the "N Days Away" suffix: it decrements daily, and _tournament_id
     # (bot.py) is built from name+region+url, so leaving it in would change
     # the id every day and re-trigger the notification throughout the window.
-    name = _DAYS_AWAY_RE.sub("", name).strip(" -\u2013\u2014").strip()
+    name = _DAYS_AWAY_RE.sub("", name).strip(" -–—").strip()
 
-    start_date = _parse_days_away(heading_text)
+    start_date = _parse_days_away(heading_text, today)
     if not start_date:
         # No countdown means the event is running or already over. Liquipedia
-        # keeps a finished event's panel (with a "3v3 Champions" result) until
-        # the next season is listed; without this check it would show up in
-        # /next as starting today for weeks. 1v1/2v2 finals can wrap up while
-        # the 3v3 event is still live, so only the 3v3 result counts.
-        if body and _has_3v3_champion(body):
+        # keeps a finished event's panel (with a "Champions" result) until the
+        # next season is listed; without this check it would show up in /next
+        # as starting today for weeks.
+        if body and _is_finished(body):
             return []
-        start_date = date.today()
+        start_date = today
 
     region = _extract_region_from_flag(heading)
 
     url = (_extract_url_from_lp_col(body) if body else None) or RLCS_BASE
-    twitch_channels = _extract_twitch_channels(body) if body else ()
+    twitch_channels = _extract_twitch_channels(body, skip_timer_cols=True) if body else ()
 
     return [
         Tournament(
@@ -161,145 +236,152 @@ def _parse_days_away_event(
     ]
 
 
-def _parse_lcq(heading: Tag, body: Tag | None, heading_text: str) -> list[Tournament]:
-    if not body:
-        return []
+def _tab_groups(panel: Tag, body: Tag) -> list[tuple[str | None, Tag]]:
+    """Split a panel body into (tab label, scope) pairs; untabbed -> one group."""
+    tabs_content = next(iter(_own(panel, body.select(".tabs-content"))), None)
+    if tabs_content is None:
+        return [(None, body)]
 
-    tournaments: list[Tournament] = []
-    cols = _get_lp_cols(body)
-
-    for col in cols:
-        region_url, region_name = _extract_region_url(col)
-        timer = col.select_one(".timer-object")
-        start_dt: datetime | None = None
-        if timer and timer.get("data-timestamp"):
-            start_dt = _parse_datetime(timer["data-timestamp"])
-        start_date = start_dt.date() if start_dt else date.today() + timedelta(days=1)
-
-        tournaments.append(
-            Tournament(
-                name=f"RLCS 2026 Last Chance Qualifier \u2014 {region_name}",
-                start_date=start_date,
-                end_date=None,
-                region=region_name,
-                liquipedia_url=region_url,
-                event_type="Last Chance Qualifier",
-                mode="3v3",
-                start_time=start_dt,
-                twitch_channels=_extract_twitch_channels(col),
-            )
-        )
-
-    return tournaments
-
-
-def _parse_opens(body: Tag | None, heading_text: str) -> list[Tournament]:
-    if not body:
-        return []
-
-    tournaments: list[Tournament] = []
-    tabs_content = body.select_one(".tabs-content")
-    if not tabs_content:
-        return tournaments
-
-    modes = {"content1": "2v2", "content2": "1v1"}
-
-    for class_name, mode in modes.items():
-        tab = tabs_content.select_one(f".{class_name}")
-        if not tab:
+    container = tabs_content.parent
+    groups: list[tuple[str | None, Tag]] = []
+    for content in tabs_content.find_all("div", recursive=False):
+        m = next((_TAB_CONTENT_RE.match(c) for c in content.get("class", [])), None)
+        if not m:
             continue
+        label_tag = container.select_one(f"ul.nav-tabs li.tab{m.group(1)}") if container else None
+        label = label_tag.get_text(" ", strip=True) if label_tag else None
+        groups.append((label or None, content))
+    return groups
 
-        cols = _get_lp_cols(tab)
-        for col in cols:
+
+def _parse_regional_columns(
+    panel: Tag, body: Tag, heading_text: str, year: str | None, today: date
+) -> list[Tournament]:
+    """One tournament per region column that carries a start timer.
+
+    Covers every "regional qualifier" layout Liquipedia has used: the tabbed
+    2v2/1v1 Opens, the untabbed 3v3 Opens and the Last Chance Qualifier.
+    """
+    if "Last Chance Qualifier" in heading_text:
+        event_type = label = "Last Chance Qualifier"
+    else:
+        event_type = "Open" if "Open" in heading_text else "Qualifier"
+        label = _RLCS_PREFIX_RE.sub("", heading_text)
+        label = re.sub(r"\bOpens\b", "Open", label).strip()
+    prefix = f"RLCS {year}" if year else "RLCS"
+
+    tournaments: list[Tournament] = []
+    for tab_label, scope in _tab_groups(panel, body):
+        is_mode = bool(tab_label and _MODE_RE.fullmatch(tab_label))
+        mode = tab_label if is_mode else "3v3"
+        full_label = f"{tab_label} {label}" if tab_label else label
+
+        for col, start_dt in _own_timer_cols(scope, panel):
+            if start_dt.date() < today:
+                continue
             region_url, region_name = _extract_region_url(col)
-            timer = col.select_one(".timer-object")
-            start_dt: datetime | None = None
-            if timer and timer.get("data-timestamp"):
-                start_dt = _parse_datetime(timer["data-timestamp"])
-            start_date = start_dt.date() if start_dt else None
-
-            if start_date and start_date >= date.today():
-                tournaments.append(
-                    Tournament(
-                        name=f"RLCS 2026 {mode} Open \u2014 {region_name}",
-                        start_date=start_date,
-                        end_date=None,
-                        region=region_name,
-                        liquipedia_url=region_url,
-                        event_type="Open",
-                        mode=mode,
-                        start_time=start_dt,
-                        twitch_channels=_extract_twitch_channels(col),
-                    )
+            tournaments.append(
+                Tournament(
+                    name=f"{prefix} {full_label} — {region_name}",
+                    start_date=start_dt.date(),
+                    end_date=None,
+                    region=region_name,
+                    liquipedia_url=region_url,
+                    event_type=event_type,
+                    mode=mode,
+                    start_time=start_dt,
+                    twitch_channels=_extract_twitch_channels(col),
                 )
+            )
 
     return tournaments
 
 
-def _parse_panel(panel: Tag) -> list[Tournament]:
+def _parse_panel(panel: Tag, today: date) -> tuple[list[Tournament], bool] | None:
+    """Parse one panel by its structure rather than by its exact title.
+
+    Returns (tournaments, recognized), or None when the panel looks like an
+    event (countdown heading or upcoming timers) but no rule claims it.
+    """
     heading = panel.select_one(".panel-box-heading")
     if not heading:
-        return []
+        return [], False
 
-    heading_text = heading.get_text(" ", strip=True)
-
+    heading_text = _clean_text(heading)
     if _is_skip_panel(heading_text):
-        return []
+        return [], False
 
     body = panel.select_one(".panel-box-body, .panel-box-collapsible-content")
+    top_level = _is_top_level(panel)
+    in_rlcs, year = _rlcs_season(panel)
+    has_countdown = bool(_DAYS_AWAY_RE.search(heading_text))
+    timer_cols = _own_timer_cols(body, panel) if body else []
 
-    if "RLCS" in heading_text and "World Championship" in heading_text:
-        return _parse_days_away_event(heading, body, heading_text, "World Championship")
+    # Headline event: a top-level RLCS panel (World Championship, Major, Club
+    # Championship, ...) that is not itself a grid of regional timers.
+    if top_level and "RLCS" in heading_text and (has_countdown or not timer_cols):
+        event_type = _headline_event_type(heading_text)
+        return _parse_days_away_event(heading, body, heading_text, event_type, today), True
 
-    if "RLCS" in heading_text and "Major" in heading_text:
-        return _parse_days_away_event(heading, body, heading_text, "Major")
+    if has_countdown and _is_under_international_events(panel):
+        event = _parse_days_away_event(heading, body, heading_text, "International Event", today)
+        return event, True
 
-    if "Last Chance Qualifier" in heading_text:
-        return _parse_lcq(heading, body, heading_text)
+    # Regional qualifiers: any RLCS panel with a start timer per region column.
+    if in_rlcs and body and timer_cols:
+        return _parse_regional_columns(panel, body, heading_text, year, today), True
 
-    if "RLCS" in heading_text and "Opens" in heading_text:
-        return _parse_opens(body, heading_text)
+    upcoming_timers = any(dt.date() >= today for _, dt in timer_cols)
+    if top_level and (has_countdown or upcoming_timers):
+        return None
 
-    if _DAYS_AWAY_RE.search(heading_text) and _is_under_international_events(panel):
-        return _parse_days_away_event(heading, body, heading_text, "International Event")
-
-    return []
+    return [], False
 
 
-def parse_tournaments(html: str) -> list[Tournament]:
+@dataclass(frozen=True, slots=True)
+class ParseResult:
+    tournaments: list[Tournament]
+    # Headings of panels that look like events but that no rule could read.
+    unrecognized: tuple[str, ...] = ()
+    # True when the page was read but not a single panel was recognized: the
+    # layout changed beyond what the parser understands.
+    blind: bool = False
+    # False when the page could not be fetched at all, so nothing is known
+    # about its layout either way.
+    fetched: bool = True
+
+
+def parse_tournaments(html: str, *, today: date | None = None) -> ParseResult:
+    today = today or date.today()
     soup = BeautifulSoup(html, "lxml")
-    tournaments: list[Tournament] = []
 
     root = soup.select_one("div.mw-parser-output")
     if not root:
         logger.warning("Could not find mw-parser-output div")
-        return tournaments
+        return ParseResult([], blind=True)
 
-    panels = root.find_all("div", class_="panel-box", recursive=False)
+    tournaments: list[Tournament] = []
+    unrecognized: list[str] = []
+    recognized = 0
 
-    for panel in panels:
+    for panel in root.find_all("div", class_="panel-box"):
         try:
-            result = _parse_panel(panel)
-            tournaments.extend(result)
-
-            nested = panel.find_all("div", class_="panel-box", recursive=True)
-            for child in nested:
-                if child is panel:
-                    continue
-                try:
-                    result = _parse_panel(child)
-                    tournaments.extend(result)
-                except Exception:
-                    logger.exception("Error parsing nested panel")
-
+            result = _parse_panel(panel, today)
         except Exception:
             logger.exception("Error parsing panel")
+            continue
+        if result is None:
+            unrecognized.append(_DAYS_AWAY_RE.sub("", _heading_text(panel)).strip(" -"))
+            continue
+        found, was_recognized = result
+        tournaments.extend(found)
+        recognized += was_recognized
 
-    return tournaments
+    return ParseResult(tournaments, tuple(unrecognized), blind=recognized == 0)
 
 
 _RAW_HTML_DIR = Path("data")
-_RAW_HTML_VERSION = 1
+_RAW_HTML_VERSION = 2
 
 
 def _save_raw_html(html: str) -> None:
@@ -310,7 +392,7 @@ def _save_raw_html(html: str) -> None:
     logger.info("Saved raw HTML to %s", path)
 
 
-async def fetch_upcoming_tournaments() -> list[Tournament]:
+async def fetch_upcoming_tournaments() -> ParseResult:
     logger.info("Fetching RLCS events from Liquipedia")
     headers = {"User-Agent": USER_AGENT}
 
@@ -320,16 +402,21 @@ async def fetch_upcoming_tournaments() -> list[Tournament]:
             _save_raw_html(html)
         except Exception:
             logger.exception("Failed to fetch RLCS Events page")
-            return []
+            return ParseResult([], fetched=False)
 
         try:
-            all_tournaments = await _run_parser(html)
+            result = parse_tournaments(html)
         except Exception:
             logger.exception("Failed to parse tournament data")
-            return []
+            return ParseResult([], blind=True)
+
+        if result.unrecognized:
+            logger.warning("Unrecognized Liquipedia panels: %s", ", ".join(result.unrecognized))
+        if result.blind:
+            logger.warning("No Liquipedia panel was recognized; the page layout may have changed")
 
         today = date.today()
-        upcoming = [t for t in all_tournaments if t.start_date >= today]
+        upcoming = [t for t in result.tournaments if t.start_date >= today]
         upcoming.sort(
             key=lambda t: (
                 t.start_time
@@ -340,8 +427,4 @@ async def fetch_upcoming_tournaments() -> list[Tournament]:
         )
 
         logger.info("Found %d upcoming RLCS tournaments", len(upcoming))
-        return upcoming
-
-
-async def _run_parser(html: str) -> list[Tournament]:
-    return parse_tournaments(html)
+        return replace(result, tournaments=upcoming)
