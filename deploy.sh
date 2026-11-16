@@ -24,7 +24,13 @@ sync_env() {
 recreate() {
     $SSH "cd $REMOTE_DIR && docker rm -f rlbot; docker run -d --name rlbot --restart unless-stopped -v rlbot-data:/app/state --env-file .env rlbot"
     echo "Waiting for bot to start..."
-    $SSH "docker logs -f rlbot 2>&1 | grep -m1 'Application started'"
+    # Poll instead of `docker logs -f | grep -m1`: grep exits on the match, but
+    # `docker logs -f` lingers until the bot's next log line (up to one poll interval).
+    if ! $SSH "timeout 120 sh -c 'until docker logs rlbot 2>&1 | grep -q \"Application started\"; do sleep 2; done'"; then
+        echo "Bot did not log 'Application started' within 120s. Last logs:" >&2
+        $SSH "docker logs --tail 30 rlbot" >&2
+        exit 1
+    fi
     echo "Bot is up."
 }
 
